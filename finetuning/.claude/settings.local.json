@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p pipelines/baseline pipelines/finetuned training)",
+      "Bash(mkdir -p resultaten/baseline resultaten/finetuned)"
+    ]
+  }
+}

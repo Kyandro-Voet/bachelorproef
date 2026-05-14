@@ -1,0 +1,36 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Tijdelijke uploads (web interface)
+temp_uploads/
+
+# Modellen (te groot voor git)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Gegenereerde/gemerged modelmappen
+finetuning/vision/merged_model/
+finetuning/vision/mlx_model/
+
+# Data — facturen bevatten mogelijk gevoelige info
+data/
+
+# Resultaten — gegenereerd, niet in versiebeheer
+resultaten/
+
+# macOS
+.DS_Store
+
+# Python version manager
+.python-version
