@@ -15,23 +15,32 @@ import ollama
 from pdf2image import convert_from_path
 from pymongo import MongoClient
 
+_PROJECT_ROOT = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "pipelines" / "time_limit.py").exists()
+)
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+from pipelines.time_limit import FACTUUR_TIMEOUT_SECONDEN, FactuurTimeout, factuur_timeout
+
 
 # ──────────────────────────────────────────────
 # CONFIGURATIE
 # ──────────────────────────────────────────────
 MODEL = "qwen3-vl:8b"
-DPI = 150
+DPI = 100
 MAX_BREEDTE = 1024
-DOCUMENTS_MAP = Path("data/training")
+DOCUMENTS_MAP = Path("data/testing")
 PIPELINE = "baseline/visie"
+RUNS = 3
 
 MONGO_URI = "mongodb://localhost:27017"
 MONGO_DB = "bachelorproef"
 MONGO_COLLECTION = "resultaten"
 
-SYSTEM_PROMPT = """Je bent een assistent voor data-extractie uit documenten.
-Extraheer de gevraagde informatie en geef deze terug als valide JSON.
-Geef ALLEEN de JSON terug, geen extra tekst of uitleg."""
+SYSTEM_PROMPT = """You are a data extraction assistant for documents.
+Extract the requested information and return it as valid JSON.
+Return ONLY the JSON, no extra text or explanation."""
 
 CATEGORIE_SCHEMAS = {
     "electricity": """{
@@ -104,12 +113,12 @@ CATEGORIE_SCHEMAS = {
 }
 
 USER_PROMPT_TEMPLATE = """/no_think
-Extraheer alle data uit dit document en geef het terug als JSON object
-dat strikt dit schema volgt:
+Extract all data from this document and return it as a JSON object
+that strictly follows this schema:
 
 {schema}
 
-Antwoord ENKEL met valide JSON. Geen extra tekst.
+Respond ONLY with valid JSON. No extra text.
 """
 
 
@@ -153,12 +162,13 @@ def ontlaad_model() -> None:
 # OPSLAG
 # ──────────────────────────────────────────────
 def sla_op_in_mongodb(resultaat: dict) -> None:
-    """Sla het resultaat op in MongoDB."""
+    """Sla één run op in MongoDB."""
     document = {
         "bestand": resultaat["bestand"],
         "categorie": resultaat["categorie"],
         "model": MODEL,
         "pipeline": PIPELINE,
+        "run": resultaat["run"],
         "success": resultaat["success"],
         "tijd_totaal": resultaat["tijd_totaal"],
         "extracted": resultaat["extracted"],
@@ -167,7 +177,7 @@ def sla_op_in_mongodb(resultaat: dict) -> None:
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
         client[MONGO_DB][MONGO_COLLECTION].insert_one(document)
-        print(f"   MongoDB: {PIPELINE} — {resultaat['bestand']}")
+        print(f"   MongoDB: {PIPELINE} run{resultaat['run']} — {resultaat['bestand']}")
     except Exception as e:
         print(f"   MongoDB FOUT: {e}")
 
@@ -204,16 +214,15 @@ def afbeeldingen_naar_base64(afbeeldingen: list) -> list[str]:
 
 
 def stap2_visie_llm(afbeeldingen: list, categorie: str) -> str:
-    """Stuur afbeeldingen rechtstreeks naar het vision-model."""
+    """Stuur alle afbeeldingen in één call naar het vision-model."""
     print(f"\n   Stap 2: Afbeeldingen naar {MODEL} sturen (categorie: {categorie})...")
     start = time.time()
 
     base64_afbeeldingen = afbeeldingen_naar_base64(afbeeldingen)
-    print(f"   {len(base64_afbeeldingen)} afbeelding(en) gecodeerd")
-
     schema = CATEGORIE_SCHEMAS.get(categorie, CATEGORIE_SCHEMAS["electricity"])
     user_prompt = USER_PROMPT_TEMPLATE.format(schema=schema)
 
+    print(f"   {len(base64_afbeeldingen)} afbeelding(en) → 1 call...")
     response = ollama.chat(
         model=MODEL,
         messages=[
@@ -227,13 +236,13 @@ def stap2_visie_llm(afbeeldingen: list, categorie: str) -> str:
         format="json",
         options={
             "temperature": 0.1,
-            "num_ctx": 8192,
+            "num_ctx": 16384,
         },
-        think=False,
+        keep_alive=0,
     )
-    ruwe_output = response.message.content
+
     print(f"   Antwoord ontvangen in {time.time()-start:.1f}s")
-    return ruwe_output
+    return response.message.content
 
 
 def stap3_parse_json(ruwe_output: str) -> dict | None:
@@ -266,31 +275,53 @@ def stap3_parse_json(ruwe_output: str) -> dict | None:
 # ──────────────────────────────────────────────
 # VERWERKING
 # ──────────────────────────────────────────────
-def verwerk_factuur(pdf_pad: Path) -> dict:
-    """Verwerk één document met het vision-model."""
+def verwerk_factuur(pdf_pad: Path) -> list[dict]:
+    """Verwerk één document in RUNS aparte cold runs."""
     categorie = pdf_pad.parent.name
 
     print(f"\n{'=' * 55}")
     print(f"  {pdf_pad.name}  [{categorie}]")
     print(f"{'=' * 55}")
 
-    ontlaad_model()
-    totaal_start = time.time()
+    runs = []
+    for run in range(1, RUNS + 1):
+        print(f"\n   Run {run}/{RUNS} — cold start ({MODEL})...")
+        ontlaad_model()
+        run_start = time.time()
 
-    afbeeldingen = stap1_pdf_naar_afbeeldingen(pdf_pad)
-    ruwe_output = stap2_visie_llm(afbeeldingen, categorie)
-    resultaat = stap3_parse_json(ruwe_output)
+        afbeeldingen = stap1_pdf_naar_afbeeldingen(pdf_pad)
+        ruwe_output = stap2_visie_llm(afbeeldingen, categorie)
+        resultaat = stap3_parse_json(ruwe_output)
 
-    totaal_tijd = time.time() - totaal_start
+        tijd_totaal = round(time.time() - run_start, 2)
+        status = "JSON OK" if resultaat is not None else "JSON FOUT"
+        print(f"   Run {run}: {status} ({tijd_totaal}s)")
 
-    return {
+        runs.append({
+            "bestand": pdf_pad.name,
+            "categorie": categorie,
+            "run": run,
+            "success": resultaat is not None,
+            "tijd_totaal": tijd_totaal,
+            "extracted": resultaat,
+            "ruwe_output": ruwe_output,
+        })
+
+    tijden = [r["tijd_totaal"] for r in runs]
+    print(f"\n   Runs klaar — tijden: {tijden}")
+    return runs
+
+
+def timeout_runs(pdf_pad: Path, fout: Exception) -> list[dict]:
+    return [{
         "bestand": pdf_pad.name,
-        "categorie": categorie,
-        "success": resultaat is not None,
-        "tijd_totaal": round(totaal_tijd, 2),
-        "extracted": resultaat,
-        "ruwe_output": ruwe_output,
-    }
+        "categorie": pdf_pad.parent.name,
+        "run": run,
+        "success": False,
+        "tijd_totaal": FACTUUR_TIMEOUT_SECONDEN,
+        "extracted": None,
+        "ruwe_output": f"Timeout: {fout}",
+    } for run in range(1, RUNS + 1)]
 
 
 def main():
@@ -310,34 +341,39 @@ def main():
         sys.exit(1)
 
     print(f"\n Visie-pipeline — Model: {MODEL}")
-    print(f"   Facturen: {len(pdfs)}")
+    print(f"   Facturen: {len(pdfs)}  |  Runs per factuur: {RUNS}")
     print(f"   Geen OCR — vision-model leest afbeeldingen rechtstreeks")
 
     # Verwerk alle facturen
-    resultaten = []
+    alle_runs = []
     for pdf_pad in pdfs:
         if not pdf_pad.exists():
             print(f" Bestand niet gevonden: {pdf_pad}")
             continue
 
-        resultaat = verwerk_factuur(pdf_pad)
-        resultaten.append(resultaat)
-
-        sla_op_in_mongodb(resultaat)
+        try:
+            with factuur_timeout():
+                runs = verwerk_factuur(pdf_pad)
+        except FactuurTimeout as e:
+            print(f"   TIMEOUT na {FACTUUR_TIMEOUT_SECONDEN // 60} min: {pdf_pad.name}")
+            runs = timeout_runs(pdf_pad, e)
+        for run in runs:
+            sla_op_in_mongodb(run)
+        alle_runs.extend(runs)
 
     # ── Samenvatting ──
     print(f"\n\n{'#' * 55}")
     print(f"  SAMENVATTING")
     print(f"{'#' * 55}")
 
-    geslaagd = sum(1 for r in resultaten if r["success"])
-    print(f"\n  Totaal:    {len(resultaten)} facturen")
+    geslaagd = sum(1 for r in alle_runs if r["success"])
+    print(f"\n  Totaal runs: {len(alle_runs)}  ({len(alle_runs) // RUNS} facturen × {RUNS})")
     print(f"  Geslaagd:  {geslaagd}")
-    print(f"  Mislukt:   {len(resultaten) - geslaagd}")
+    print(f"  Mislukt:   {len(alle_runs) - geslaagd}")
 
-    for r in resultaten:
+    for r in alle_runs:
         status = "OK" if r["success"] else "FOUT"
-        print(f"\n  [{status}] {r['categorie']}/{r['bestand']} ({r['tijd_totaal']}s)")
+        print(f"\n  [{status}] {r['categorie']}/{r['bestand']} run{r['run']} ({r['tijd_totaal']}s)")
 
 
 if __name__ == "__main__":

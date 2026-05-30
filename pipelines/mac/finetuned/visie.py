@@ -1,26 +1,23 @@
 """
-Visiepipeline met finetuned model: PDF → afbeeldingen → MLX VLM → JSON
-PDF-conversie eenmalig, MLX-inferentie 3x voor betrouwbare tijdmeting.
+Visiepipeline met finetuned model (Mac): PDF → afbeeldingen → MLX VLM → JSON
+Geen OCR — het vision-model leest de documenten rechtstreeks.
 
 Model: finetuning/vision/mlx_model (MLX 4-bit gekwantiseerd)
-Input:  documents_testing/<categorie>/<naam>.pdf
-Output: resultaten/visie_ft/<categorie>/<naam>.json
+Input:  data/testing/<categorie>/<naam>.pdf
+Output: resultaten/mac/finetuned/visie/<categorie>/<naam>_run<N>.json
 """
 
-import base64
-import io
 import json
 import os
-import platform
+import subprocess
 import sys
 import tempfile
 import time
+import gc
 from pathlib import Path
 
-import ollama
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
-from pymongo import MongoClient
 
 _PROJECT_ROOT = next(
     parent for parent in Path(__file__).resolve().parents
@@ -34,19 +31,17 @@ from pipelines.time_limit import FACTUUR_TIMEOUT_SECONDEN, FactuurTimeout, factu
 # ──────────────────────────────────────────────
 # CONFIGURATIE
 # ──────────────────────────────────────────────
-MLX_MODEL_PAD = Path(__file__).resolve().parent.parent.parent / "finetuning/vision/mlx_model"
-VISION_MODEL_OLLAMA = "qwen3vl-8b-finetuned"
-_USE_MLX = platform.system() == "Darwin"
-DPI = 150
+MLX_MODEL_PAD = Path(__file__).resolve().parent.parent.parent.parent / "finetuning/vision/mlx_model"
+DPI = 100
 MAX_BREEDTE = 1024
-PAGINAS_PER_BATCH = 2
+PAGINAS_PER_BATCH = 5
+MLX_MAX_TOKENS = 8192
+MLX_FALLBACK_MAX_TOKENS = 4096
+MLX_TIMEOUT = 600
 DOCUMENTS_MAP = Path("data/testing")
-PIPELINE = "finetuned/visie"
+PIPELINE = "mac/finetuned/visie"
+RESULTATEN_MAP = Path("resultaten/mac/finetuned/visie")
 RUNS = 3
-
-MONGO_URI = "mongodb://localhost:27017"
-MONGO_DB = "bachelorproef"
-MONGO_COLLECTION = "resultaten"
 
 CATEGORIE_SCHEMAS = {
     "electricity": """{
@@ -124,49 +119,23 @@ that strictly follows this schema:
 
 {schema}
 
-Answer ONLY with valid JSON. No extra text."""
+Respond ONLY with valid JSON. No extra text.
+"""
 
 
 # ──────────────────────────────────────────────
-# MLX VLM
+# MLX MODEL CACHE
 # ──────────────────────────────────────────────
 _mlx_model = None
 _mlx_processor = None
 _mlx_config = None
 
 
-def _wacht_op_unload(model_naam: str, timeout: float = 30.0) -> None:
-    try:
-        actief = {m.model for m in ollama.ps().models}
-    except Exception:
-        return
-    if not any(m.startswith(model_naam) for m in actief):
-        return
-    try:
-        ollama.generate(model=model_naam, prompt="", keep_alive=0)
-    except Exception:
-        pass
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            actief = {m.model for m in ollama.ps().models}
-            if not any(m.startswith(model_naam) for m in actief):
-                return
-        except Exception:
-            return
-        time.sleep(0.5)
-    print(f"   Waarschuwing: {model_naam} nog steeds geladen na {timeout:.0f}s")
-
-
 def ontlaad_mlx_model() -> None:
-    """Reset de model cache zodat de volgende run een cold run is."""
     global _mlx_model, _mlx_processor, _mlx_config
-    if _USE_MLX:
-        _mlx_model = None
-        _mlx_processor = None
-        _mlx_config = None
-    else:
-        _wacht_op_unload(VISION_MODEL_OLLAMA)
+    _mlx_model = None
+    _mlx_processor = None
+    _mlx_config = None
 
 
 def _laad_mlx_model():
@@ -189,62 +158,50 @@ def _laad_mlx_model():
     return _mlx_model, _mlx_processor, _mlx_config
 
 
-def haal_gpu_cpu_verdeling(model_naam: str) -> dict | None:
+# ──────────────────────────────────────────────
+# INFERENTIE
+# ──────────────────────────────────────────────
+def mlx_inferentie(afbeelding: Image.Image, prompt_tekst: str, max_tokens: int = MLX_MAX_TOKENS) -> tuple[str, float]:
+    helper = Path(__file__).resolve().parent / "mlx_vision_infer.py"
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as img_file:
+        afbeelding.save(img_file, format="JPEG", quality=75)
+        temp_img = img_file.name
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as prompt_file:
+        prompt_file.write(prompt_tekst)
+        temp_prompt = prompt_file.name
+    start = time.time()
     try:
-        for m in ollama.ps().models:
-            if m.model.startswith(model_naam.split(":")[0]):
-                vram = m.size_vram
-                ram = m.size - vram
-                print(f"   GPU: {vram / 1024**3:.2f} GB | CPU: {ram / 1024**3:.2f} GB")
-                return {"gpu_gb": round(vram / 1024**3, 2), "cpu_gb": round(ram / 1024**3, 2)}
-    except Exception:
-        pass
-    return None
-
-
-def mlx_inferentie(afbeelding: Image.Image, prompt_tekst: str, max_tokens: int = 2048) -> tuple[str, float, dict | None]:
-    """Voer VLM inferentie uit. Geeft (output, tijd, gpu_cpu) terug.
-    Mac: MLX (Apple Silicon). Linux: Ollama (NVIDIA / Intel Arc).
-    """
-    if not _USE_MLX:
-        buf = io.BytesIO()
-        afbeelding.save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        start = time.time()
-        response = ollama.chat(
-            model=VISION_MODEL_OLLAMA,
-            messages=[{"role": "user", "content": prompt_tekst, "images": [b64]}],
-            options={"temperature": 0.1, "num_predict": max_tokens},
-            keep_alive=0,
-        )
-        gpu_cpu = haal_gpu_cpu_verdeling(VISION_MODEL_OLLAMA)
-        return response.message.content, round(time.time() - start, 2), gpu_cpu
-
-    from mlx_vlm import generate
-    from mlx_vlm.prompt_utils import apply_chat_template
-
-    model, processor, config = _laad_mlx_model()
-
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        afbeelding.save(f, format="JPEG", quality=85)
-        temp_pad = f.name
-
-    try:
-        formatted = apply_chat_template(processor, config, prompt_tekst, num_images=1)
-        start = time.time()
-        output = generate(
-            model, processor, formatted,
-            image=temp_pad,
-            max_tokens=max_tokens,
-            temp=0.1,
-            verbose=False,
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(helper),
+                "--model", str(MLX_MODEL_PAD),
+                "--image", temp_img,
+                "--prompt", temp_prompt,
+                "--max-tokens", str(max_tokens),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=MLX_TIMEOUT,
         )
         tijd = time.time() - start
+        if result.returncode != 0:
+            fouttekst = (result.stderr or result.stdout).strip()
+            regels = [r for r in fouttekst.splitlines() if r.strip()]
+            preview = "\n".join(regels[-8:]) if regels else "onbekend"
+            print(f"      MLX batch overgeslagen door fout (exit {result.returncode}):\n{preview}")
+            return "", round(tijd, 2)
+        return result.stdout.strip(), round(tijd, 2)
+    except subprocess.TimeoutExpired:
+        tijd = time.time() - start
+        print(f"      MLX batch overgeslagen: timeout na {MLX_TIMEOUT}s")
+        return "", round(tijd, 2)
     finally:
-        os.unlink(temp_pad)
-
-    tekst = output.text if hasattr(output, "text") else str(output)
-    return tekst, round(tijd, 2), None  # MLX rapporteert niet via Ollama
+        for pad in (temp_img, temp_prompt):
+            try:
+                os.unlink(pad)
+            except OSError:
+                pass
 
 
 # ──────────────────────────────────────────────
@@ -258,7 +215,6 @@ def schaal_afbeelding(img: Image.Image, max_breedte: int = MAX_BREEDTE) -> Image
 
 
 def combineer_paginas(afbeeldingen: list[Image.Image]) -> Image.Image:
-    """Stapel pagina's verticaal met een grijze scheidingsbalk."""
     geschaald = [schaal_afbeelding(img) for img in afbeeldingen]
     if len(geschaald) == 1:
         return geschaald[0]
@@ -276,28 +232,97 @@ def combineer_paginas(afbeeldingen: list[Image.Image]) -> Image.Image:
     return gecombineerd
 
 
-def verwerk_in_batches(paginas: list[Image.Image], prompt: str) -> tuple[str, float, dict | None]:
-    """
-    Verwerk pagina's in batches van PAGINAS_PER_BATCH.
-    Elke batch wordt gecombineerd tot één afbeelding en als aparte inferentie-call verwerkt.
-    De outputs worden samengevoegd voor de uiteindelijke JSON-parsing.
-    """
-    alle_outputs = []
+def _merge_resultaten(resultaten: list[dict]) -> dict | None:
+    """Voeg JSON-dicts van meerdere batches samen door arrays te combineren."""
+    if not resultaten:
+        return None
+    merged: dict = {}
+    for r in resultaten:
+        for key, value in r.items():
+            if key not in merged:
+                merged[key] = value
+            elif isinstance(value, list) and isinstance(merged[key], list):
+                merged[key].extend(value)
+    return merged or None
+
+
+def verwerk_in_batches(
+    paginas: list[Image.Image],
+    prompt: str,
+    start_index: int = 0,
+    paginas_per_batch: int = PAGINAS_PER_BATCH,
+    max_tokens: int = MLX_MAX_TOKENS,
+) -> tuple[dict | None, str, float]:
+    batch_resultaten = []
+    ruwe_outputs = []
     totaal_tijd = 0.0
-    laatste_gpu_cpu = None
-    batches = [paginas[i:i + PAGINAS_PER_BATCH] for i in range(0, len(paginas), PAGINAS_PER_BATCH)]
+    batches = [paginas[i:i + paginas_per_batch] for i in range(0, len(paginas), paginas_per_batch)]
 
     for b, batch in enumerate(batches):
-        pagina_nrs = f"{b * PAGINAS_PER_BATCH + 1}-{b * PAGINAS_PER_BATCH + len(batch)}"
+        eerste = start_index + b * paginas_per_batch + 1
+        laatste = eerste + len(batch) - 1
+        pagina_nrs = f"{eerste}-{laatste}"
         print(f"      Batch {b + 1}/{len(batches)} (pagina's {pagina_nrs})...")
         gecombineerd = combineer_paginas(batch)
-        output, tijd, gpu_cpu = mlx_inferentie(gecombineerd, prompt)
+        output, tijd = mlx_inferentie(gecombineerd, prompt, max_tokens=max_tokens)
         totaal_tijd += tijd
-        alle_outputs.append(output)
-        if gpu_cpu is not None:
-            laatste_gpu_cpu = gpu_cpu
+        ruwe_outputs.append(output)
 
-    return "\n\n".join(alle_outputs), round(totaal_tijd, 2), laatste_gpu_cpu
+        geparsed = parse_json(output)
+        if geparsed:
+            batch_resultaten.append(geparsed)
+        else:
+            preview = repr(output[:300]) if output else "(leeg)"
+            print(f"      Batch {b + 1}: geen geldige JSON — {preview}")
+
+    return _merge_resultaten(batch_resultaten), "\n\n".join(ruwe_outputs), round(totaal_tijd, 2)
+
+
+def verwerk_pdf_in_batches(pdf_pad: Path, prompt: str) -> tuple[dict | None, str, float]:
+    info = pdfinfo_from_path(str(pdf_pad))
+    aantal_paginas = int(info["Pages"])
+    batch_resultaten = []
+    ruwe_outputs = []
+    totaal_tijd = 0.0
+    totaal_batches = -(-aantal_paginas // PAGINAS_PER_BATCH)
+
+    for batch_index, eerste in enumerate(range(1, aantal_paginas + 1, PAGINAS_PER_BATCH), start=1):
+        laatste = min(eerste + PAGINAS_PER_BATCH - 1, aantal_paginas)
+        print(f"      PDF pagina's {eerste}-{laatste} converteren ({DPI} DPI)...")
+        paginas = convert_from_path(str(pdf_pad), dpi=DPI, first_page=eerste, last_page=laatste)
+        print(f"      MLX batch {batch_index}/{totaal_batches} ({len(paginas)} pagina's)...")
+        extracted, ruwe_output, tijd = verwerk_in_batches(paginas, prompt, start_index=eerste - 1)
+        totaal_tijd += tijd
+        if extracted:
+            batch_resultaten.append(extracted)
+            ruwe_outputs.append(ruwe_output)
+        elif len(paginas) > 1:
+            print("      Batch faalde; retry per pagina met lagere max_tokens...")
+            for offset, pagina in enumerate(paginas):
+                pagina_nr = eerste + offset
+                extracted_page, raw_page, tijd_page = verwerk_in_batches(
+                    [pagina],
+                    prompt,
+                    start_index=pagina_nr - 1,
+                    paginas_per_batch=1,
+                    max_tokens=MLX_FALLBACK_MAX_TOKENS,
+                )
+                totaal_tijd += tijd_page
+                if extracted_page:
+                    batch_resultaten.append(extracted_page)
+                ruwe_outputs.append(raw_page)
+                gc.collect()
+                ontlaad_mlx_model()
+        else:
+            ruwe_outputs.append(ruwe_output)
+
+        for pagina in paginas:
+            pagina.close()
+        del paginas
+        gc.collect()
+        ontlaad_mlx_model()
+
+    return _merge_resultaten(batch_resultaten), "\n\n".join(ruwe_outputs), round(totaal_tijd, 2)
 
 
 # ──────────────────────────────────────────────
@@ -327,32 +352,30 @@ def parse_json(ruwe_output: str) -> dict | None:
 # OPSLAG
 # ──────────────────────────────────────────────
 def sla_run_op(resultaat: dict) -> None:
-    """Sla één run op in MongoDB."""
+    uitvoer_map = RESULTATEN_MAP / resultaat["categorie"]
+    uitvoer_map.mkdir(parents=True, exist_ok=True)
+    stem = Path(resultaat["bestand"]).stem
+    pad = uitvoer_map / f"{stem}_run{resultaat['run']}.json"
     document = {
         "bestand": resultaat["bestand"],
         "categorie": resultaat["categorie"],
-        "model": MLX_MODEL_PAD.name if _USE_MLX else VISION_MODEL_OLLAMA,
+        "model": MLX_MODEL_PAD.name,
         "pipeline": PIPELINE,
         "run": resultaat["run"],
         "success": resultaat["success"],
         "tijd_totaal": resultaat["tijd_totaal"],
         "extracted": resultaat["extracted"],
         "ruwe_output": resultaat["ruwe_output"],
-        "gpu_cpu": resultaat["gpu_cpu"],
     }
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-        client[MONGO_DB][MONGO_COLLECTION].insert_one(document)
-        print(f"   MongoDB: {PIPELINE} run{resultaat['run']} — {resultaat['bestand']}")
-    except Exception as e:
-        print(f"   MongoDB FOUT: {e}")
+    with open(pad, "w", encoding="utf-8") as f:
+        json.dump(document, f, ensure_ascii=False, indent=2)
+    print(f"   Opgeslagen: {pad}")
 
 
 # ──────────────────────────────────────────────
 # VERWERKING (met 3 aparte runs)
 # ──────────────────────────────────────────────
 def verwerk_factuur(pdf_pad: Path) -> list[dict]:
-    """Verwerk één factuur in RUNS aparte cold runs. Elke run doet PDF-conversie + inferentie opnieuw."""
     categorie = pdf_pad.parent.name
 
     print(f"\n{'=' * 60}")
@@ -364,37 +387,26 @@ def verwerk_factuur(pdf_pad: Path) -> list[dict]:
 
     runs = []
     for run in range(1, RUNS + 1):
-        backend = "MLX" if _USE_MLX else "Ollama"
-        print(f"\n   Run {run}/{RUNS} — cold start ({backend})...")
+        print(f"\n   Run {run}/{RUNS} — cold start (MLX)...")
         ontlaad_mlx_model()
 
         run_start = time.time()
 
-        # PDF → afbeeldingen per run
-        print(f"\n   PDF → afbeeldingen ({DPI} DPI)...")
-        paginas = convert_from_path(str(pdf_pad), dpi=DPI)
-        print(f"   {len(paginas)} pagina('s) in {time.time() - run_start:.1f}s")
-
-        n_batches = -(-len(paginas) // PAGINAS_PER_BATCH)  # ceiling division
-        print(f"   MLX inferentie ({len(paginas)} pagina's, {n_batches} batch(es))...")
-        ruwe_output, _, gpu_cpu = verwerk_in_batches(paginas, prompt)
+        print(f"\n   PDF → afbeeldingen per batch ({DPI} DPI)...")
+        extracted, ruwe_output, _ = verwerk_pdf_in_batches(pdf_pad, prompt)
 
         tijd_totaal = round(time.time() - run_start, 2)
-        extracted = parse_json(ruwe_output)
         status = "JSON OK" if extracted is not None else "JSON FOUT"
         print(f"   Run {run}: {status} ({tijd_totaal}s totaal incl. PDF-conversie)")
 
         runs.append({
             "bestand": pdf_pad.name,
             "categorie": categorie,
-            "model": MLX_MODEL_PAD.name if _USE_MLX else VISION_MODEL_OLLAMA,
-            "pipeline": PIPELINE,
             "run": run,
             "success": extracted is not None,
             "tijd_totaal": tijd_totaal,
             "extracted": extracted,
             "ruwe_output": ruwe_output,
-            "gpu_cpu": gpu_cpu,
         })
 
     tijden = [r["tijd_totaal"] for r in runs]
@@ -403,9 +415,10 @@ def verwerk_factuur(pdf_pad: Path) -> list[dict]:
 
 
 def timeout_runs(pdf_pad: Path, fout: Exception) -> list[dict]:
+    categorie = pdf_pad.parent.name
     return [{
         "bestand": pdf_pad.name,
-        "categorie": pdf_pad.parent.name,
+        "categorie": categorie,
         "run": run,
         "success": False,
         "tijd_totaal": FACTUUR_TIMEOUT_SECONDEN,
@@ -418,6 +431,11 @@ def timeout_runs(pdf_pad: Path, fout: Exception) -> list[dict]:
 # MAIN
 # ──────────────────────────────────────────────
 def main() -> None:
+    if not MLX_MODEL_PAD.exists():
+        print(f"   FOUT: MLX model niet gevonden: {MLX_MODEL_PAD}")
+        print("   Voer eerst finetuning/vision/convert_mlx.py uit.")
+        sys.exit(1)
+
     if len(sys.argv) >= 2:
         pdfs = [Path(sys.argv[1])]
     else:
@@ -430,7 +448,7 @@ def main() -> None:
         print("   Geen PDF-bestanden gevonden.")
         sys.exit(1)
 
-    print(f"\n   Visiepipeline (finetuned) — MLX model: {MLX_MODEL_PAD.name}")
+    print(f"\n   Visiepipeline finetuned (Mac) — MLX model: {MLX_MODEL_PAD.name}")
     print(f"   Facturen: {len(pdfs)}  |  Runs per factuur: {RUNS}")
 
     alle_runs = []
@@ -438,6 +456,16 @@ def main() -> None:
         if not pdf_pad.exists():
             print(f"   Bestand niet gevonden: {pdf_pad}")
             continue
+
+        categorie = pdf_pad.parent.name
+        alle_runs_bestaan = all(
+            (RESULTATEN_MAP / categorie / f"{pdf_pad.stem}_run{r}.json").exists()
+            for r in range(1, RUNS + 1)
+        )
+        if alle_runs_bestaan:
+            print(f"   Overgeslagen (alle {RUNS} runs bestaan al): {pdf_pad.name}")
+            continue
+
         try:
             with factuur_timeout():
                 runs = verwerk_factuur(pdf_pad)

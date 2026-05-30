@@ -12,16 +12,27 @@ wheels/
 # Tijdelijke uploads (web interface)
 temp_uploads/
 
-# Modellen (te groot voor git)
+# Grote modelbestanden
 *.gguf
 *.safetensors
 *.bin
 *.pt
 *.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
 
-# Gegenereerde/gemerged modelmappen
+# Finetuning — gegenereerde/gemerged modelmappen (te groot)
 finetuning/vision/merged_model/
 finetuning/vision/mlx_model/
+finetuning/text/merged_model/
+finetuning/text/mlx_model/
+
+# Training — checkpoints en outputs (te groot)
+training/checkpoints/
+training/output/
+training/runs/
 
 # Data — facturen bevatten mogelijk gevoelige info
 data/
@@ -31,6 +42,11 @@ resultaten/
 
 # macOS
 .DS_Store
+**/.DS_Store
+
+# IDE / tool config
+.antigravitycli/
+.claude/
 
 # Python version manager
 .python-version

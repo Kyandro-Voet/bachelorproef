@@ -1,5 +1,5 @@
 """
-Minimale tekstpipeline: PDF → tekst → LLM → JSON
+Tekstpipeline (Mac): PDF → tekst → LLM → JSON
 Digitale PDF: tekst direct via pdfplumber (geen afbeeldingen nodig).
 Gescande PDF: pagina naar afbeelding → Tesseract OCR.
 Ondersteunt categorieën: electricity, water, natural gas, waste, fuels
@@ -12,9 +12,9 @@ import time
 from pathlib import Path
 
 import ollama
+from ollama import Client
 import pdfplumber
 from pdf2image import convert_from_path
-from pymongo import MongoClient
 import pytesseract
 
 _PROJECT_ROOT = next(
@@ -33,11 +33,9 @@ MODEL = "qwen3:8b-q4_K_M"
 OCR_TALEN = "eng+ita"
 DPI = 300
 DOCUMENTS_MAP = Path("data/testing")
-PIPELINE = "baseline/tekst"
-
-MONGO_URI = "mongodb://localhost:27017"
-MONGO_DB = "bachelorproef"
-MONGO_COLLECTION = "resultaten"
+PIPELINE = "mac/baseline/tekst"
+RESULTATEN_MAP = Path("resultaten/mac/baseline/tekst")
+RUNS = 3
 MAX_TEKST_TEKENS = 36000
 
 SYSTEM_PROMPT = """You are a precise data extraction assistant.
@@ -132,7 +130,7 @@ that strictly follows this schema:
 
 
 # ──────────────────────────────────────────────
-# COLD RUN
+# HULPFUNCTIES
 # ──────────────────────────────────────────────
 def toon_gpu_cpu_verdeling() -> None:
     try:
@@ -167,22 +165,19 @@ def opkuis_tekst(tekst: str) -> str:
 
 
 def _wacht_op_unload(model_naam: str, timeout: float = 30.0) -> None:
-    """Stuur unload-request en poll tot het model echt uit Ollama-geheugen is."""
-    # Alleen unloaden als het model momenteel geladen is
     try:
         actief = {m.model for m in ollama.ps().models}
     except Exception:
         return
 
     if not any(m.startswith(model_naam) for m in actief):
-        return  # al niet geladen, niets te doen
+        return
 
     try:
         ollama.generate(model=model_naam, prompt="", keep_alive=0)
     except Exception:
         pass
 
-    # Poll tot het model verdwenen is uit /api/ps
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -197,42 +192,38 @@ def _wacht_op_unload(model_naam: str, timeout: float = 30.0) -> None:
 
 
 def ontlaad_model() -> None:
-    """Verwijder het model uit het Ollama-geheugen zodat elke run een cold run is."""
     _wacht_op_unload(MODEL)
 
 
 # ──────────────────────────────────────────────
 # OPSLAG
 # ──────────────────────────────────────────────
-def sla_op_in_mongodb(resultaat: dict) -> None:
-    """Sla het resultaat op in MongoDB."""
+def sla_run_op(resultaat: dict) -> None:
+    uitvoer_map = RESULTATEN_MAP / resultaat["categorie"]
+    uitvoer_map.mkdir(parents=True, exist_ok=True)
+    stem = Path(resultaat["bestand"]).stem
+    pad = uitvoer_map / f"{stem}_run{resultaat['run']}.json"
     document = {
         "bestand": resultaat["bestand"],
         "categorie": resultaat["categorie"],
         "model": MODEL,
         "pipeline": PIPELINE,
+        "run": resultaat["run"],
         "success": resultaat["success"],
         "tijd_totaal": resultaat["tijd_totaal"],
         "extracted": resultaat["extracted"],
         "ocr_tekst": resultaat["ocr_tekst"],
         "ruwe_output": resultaat["ruwe_output"],
     }
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-        client[MONGO_DB][MONGO_COLLECTION].insert_one(document)
-        print(f"   MongoDB: {PIPELINE} — {resultaat['bestand']}")
-    except Exception as e:
-        print(f"   MongoDB FOUT: {e}")
+    with open(pad, "w", encoding="utf-8") as f:
+        json.dump(document, f, ensure_ascii=False, indent=2)
+    print(f"   Opgeslagen: {pad}")
 
 
 # ──────────────────────────────────────────────
 # PIPELINE STAPPEN
 # ──────────────────────────────────────────────
 def stap1_extraheer_tekst(pdf_pad: Path) -> str:
-    """Extraheer tekst per pagina.
-    Digitale pagina (>= 50 tekens): pdfplumber leest tekst direct.
-    Gescande pagina (< 50 tekens): afbeelding → Tesseract OCR.
-    """
     print(f"\n   Stap 1: Tekst extraheren uit PDF...")
     start = time.time()
     alle_tekst = []
@@ -264,7 +255,8 @@ def stap2_llm(tekst: str, categorie: str) -> str:
     schema = CATEGORIE_SCHEMAS.get(categorie, CATEGORIE_SCHEMAS["electricity"])
     user_prompt = USER_PROMPT_TEMPLATE.format(schema=schema) + tekst
 
-    response = ollama.chat(
+    client = Client(timeout=600.0)
+    response = client.chat(
         model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -274,8 +266,6 @@ def stap2_llm(tekst: str, categorie: str) -> str:
         options={
             "temperature": 0.1,
             "num_ctx": 16384,
-            "cache_type_k": "q4_0",
-            "cache_type_v": "q4_0",
         },
         keep_alive=0,
         think=False,
@@ -305,7 +295,6 @@ def stap3_parse_json(ruwe_output: str) -> dict | None:
 
     try:
         resultaat = json.loads(opgeschoond)
-        # Afwijzen als het model een foutmelding teruggeeft i.p.v. data
         if "error" in resultaat and len(resultaat) == 1:
             print(f"   Model-fout: {resultaat}")
             return None
@@ -320,96 +309,112 @@ def stap3_parse_json(ruwe_output: str) -> dict | None:
 # ──────────────────────────────────────────────
 # VERWERKING
 # ──────────────────────────────────────────────
-def verwerk_factuur(pdf_pad: Path) -> dict:
-    """Verwerk één factuur en geef het resultaat terug."""
+def verwerk_factuur(pdf_pad: Path) -> list[dict]:
     categorie = pdf_pad.parent.name
 
-    print(f"\n{'=' * 55}")
-    print(f"   {pdf_pad.name}  [{categorie}]")
-    print(f"{'=' * 55}")
+    print(f"\n{'=' * 60}")
+    print(f"  {pdf_pad.name}  [{categorie}]")
+    print(f"{'=' * 60}")
 
-    ontlaad_model()
-    totaal_start = time.time()
+    runs = []
+    for run in range(1, RUNS + 1):
+        print(f"\n   Run {run}/{RUNS} — cold start ({MODEL})...")
+        ontlaad_model()
 
-    tekst = opkuis_tekst(stap1_extraheer_tekst(pdf_pad))
-    ruwe_output = stap2_llm(tekst, categorie)
-    resultaat = stap3_parse_json(ruwe_output)
+        run_start = time.time()
 
-    totaal_tijd = time.time() - totaal_start
+        tekst = opkuis_tekst(stap1_extraheer_tekst(pdf_pad))
+        ruwe_output = stap2_llm(tekst, categorie)
+        extracted = stap3_parse_json(ruwe_output)
 
-    return {
+        tijd_totaal = round(time.time() - run_start, 2)
+        status = "JSON OK" if extracted is not None else "JSON FOUT"
+        print(f"   Run {run}: {status} ({tijd_totaal}s totaal)")
+
+        runs.append({
+            "bestand": pdf_pad.name,
+            "categorie": categorie,
+            "run": run,
+            "success": extracted is not None,
+            "tijd_totaal": tijd_totaal,
+            "extracted": extracted,
+            "ocr_tekst": tekst,
+            "ruwe_output": ruwe_output,
+        })
+
+    tijden = [r["tijd_totaal"] for r in runs]
+    print(f"\n   Runs klaar — tijden: {tijden}")
+    return runs
+
+
+def timeout_runs(pdf_pad: Path, fout: Exception) -> list[dict]:
+    categorie = pdf_pad.parent.name
+    return [{
         "bestand": pdf_pad.name,
         "categorie": categorie,
-        "success": resultaat is not None,
-        "tijd_totaal": round(totaal_tijd, 2),
-        "extracted": resultaat,
-        "ocr_tekst": tekst,
-        "ruwe_output": ruwe_output,
-    }
-
-
-def timeout_resultaat(pdf_pad: Path, fout: Exception) -> dict:
-    return {
-        "bestand": pdf_pad.name,
-        "categorie": pdf_pad.parent.name,
+        "run": run,
         "success": False,
         "tijd_totaal": FACTUUR_TIMEOUT_SECONDEN,
         "extracted": None,
         "ocr_tekst": "",
         "ruwe_output": f"Timeout: {fout}",
-    }
+    } for run in range(1, RUNS + 1)]
 
 
 def main():
-    # Bepaal welke PDF's verwerkt moeten worden
     if len(sys.argv) >= 2:
         pdfs = [Path(sys.argv[1])]
     else:
         if not DOCUMENTS_MAP.exists():
-            print(f" Map '{DOCUMENTS_MAP}' niet gevonden.")
-            print(f"   Gebruik: uv run python main.py <pad/naar/factuur.pdf>")
-            print(f"   Of plaats PDF's in categoriesubmappen van '{DOCUMENTS_MAP}/'.")
+            print(f"   Map '{DOCUMENTS_MAP}' niet gevonden.")
             sys.exit(1)
         pdfs = sorted(DOCUMENTS_MAP.rglob("*.pdf"))
 
     if not pdfs:
-        print(" Geen PDF-bestanden gevonden.")
+        print("   Geen PDF-bestanden gevonden.")
         sys.exit(1)
 
-    print(f"\n Tekstpipeline — Model: {MODEL}")
-    print(f"   Facturen: {len(pdfs)}")
+    print(f"\n   Tekstpipeline (Mac) — Model: {MODEL}")
+    print(f"   Facturen: {len(pdfs)}  |  Runs per factuur: {RUNS}")
     print(f"   OCR-talen: {OCR_TALEN}")
 
-    # Verwerk alle facturen
-    resultaten = []
+    alle_runs = []
     for pdf_pad in pdfs:
         if not pdf_pad.exists():
-            print(f" Bestand niet gevonden: {pdf_pad}")
+            print(f"   Bestand niet gevonden: {pdf_pad}")
+            continue
+
+        categorie = pdf_pad.parent.name
+        alle_runs_bestaan = all(
+            (RESULTATEN_MAP / categorie / f"{pdf_pad.stem}_run{r}.json").exists()
+            for r in range(1, RUNS + 1)
+        )
+        if alle_runs_bestaan:
+            print(f"   Overgeslagen (alle {RUNS} runs bestaan al): {pdf_pad.name}")
             continue
 
         try:
             with factuur_timeout():
-                resultaat = verwerk_factuur(pdf_pad)
+                runs = verwerk_factuur(pdf_pad)
         except FactuurTimeout as e:
             print(f"   TIMEOUT na {FACTUUR_TIMEOUT_SECONDEN // 60} min: {pdf_pad.name}")
-            resultaat = timeout_resultaat(pdf_pad, e)
-        resultaten.append(resultaat)
+            runs = timeout_runs(pdf_pad, e)
+        for run in runs:
+            sla_run_op(run)
+        alle_runs.extend(runs)
 
-        sla_op_in_mongodb(resultaat)
-
-    # ── Samenvatting ──
     print(f"\n\n{'#' * 55}")
     print(f"  SAMENVATTING")
     print(f"{'#' * 55}")
 
-    geslaagd = sum(1 for r in resultaten if r["success"])
-    print(f"\n  Totaal:    {len(resultaten)} facturen")
-    print(f"  Geslaagd:  {geslaagd}")
-    print(f"  Mislukt:   {len(resultaten) - geslaagd}")
+    geslaagd = sum(1 for r in alle_runs if r["success"])
+    print(f"\n  Totaal runs: {len(alle_runs)}  ({len(alle_runs) // RUNS} facturen × {RUNS})")
+    print(f"  Geslaagd:    {geslaagd}")
+    print(f"  Mislukt:     {len(alle_runs) - geslaagd}")
 
-    for r in resultaten:
+    for r in alle_runs:
         status = "OK" if r["success"] else "FOUT"
-        print(f"\n  [{status}] {r['categorie']}/{r['bestand']} ({r['tijd_totaal']}s)")
+        print(f"  [{status}] {r['categorie']}/{r['bestand']} run{r['run']} ({r['tijd_totaal']}s)")
 
 
 if __name__ == "__main__":

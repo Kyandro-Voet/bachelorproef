@@ -10,6 +10,7 @@ Output: resultaten/tekst_ft/<categorie>/<naam>.json
 """
 
 import json
+import re
 import subprocess
 import sys
 import time
@@ -20,6 +21,14 @@ import pdfplumber
 from pdf2image import convert_from_path
 from pymongo import MongoClient
 import pytesseract
+
+_PROJECT_ROOT = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "pipelines" / "time_limit.py").exists()
+)
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+from pipelines.time_limit import FACTUUR_TIMEOUT_SECONDEN, FactuurTimeout, factuur_timeout
 
 
 # ──────────────────────────────────────────────
@@ -36,6 +45,7 @@ RUNS = 3
 MONGO_URI = "mongodb://localhost:27017"
 MONGO_DB = "bachelorproef"
 MONGO_COLLECTION = "resultaten"
+MAX_TEKST_TEKENS = 36000
 
 SYSTEM_PROMPT = """You are a precise data extraction assistant.
 Your sole task is to extract structured information from utility/resource documents and return it as valid JSON.
@@ -131,6 +141,39 @@ that strictly follows this schema:
 # ──────────────────────────────────────────────
 # COLD RUN
 # ──────────────────────────────────────────────
+def toon_gpu_cpu_verdeling() -> dict | None:
+    try:
+        for m in ollama.ps().models:
+            if m.model.startswith(MODEL.split(":")[0]):
+                vram = m.size_vram
+                ram = m.size - vram
+                print(f"   GPU: {vram / 1024**3:.2f} GB | CPU: {ram / 1024**3:.2f} GB")
+                return {"gpu_gb": round(vram / 1024**3, 2), "cpu_gb": round(ram / 1024**3, 2)}
+    except Exception:
+        pass
+    return None
+
+
+def opkuis_tekst(tekst: str) -> str:
+    # Elke regel trimmen, decoratieve lijnen en triviale regels verwijderen
+    regels = []
+    for regel in tekst.splitlines():
+        regel = regel.strip()
+        if re.match(r'^[-=_.]{4,}$', regel):
+            continue
+        if 0 < len(regel) < 3:
+            continue
+        regels.append(regel)
+    tekst = "\n".join(regels)
+    tekst = re.sub(r'[ \t]+', ' ', tekst)
+    tekst = re.sub(r'\n{3,}', '\n\n', tekst)
+    tekst = tekst.strip()
+    if len(tekst) > MAX_TEKST_TEKENS:
+        print(f"   Waarschuwing: tekst ({len(tekst)} tekens) afgekapt op {MAX_TEKST_TEKENS}")
+        tekst = tekst[:MAX_TEKST_TEKENS]
+    return tekst
+
+
 def _wacht_op_unload(model_naam: str, timeout: float = 30.0) -> None:
     """Stuur unload-request en poll tot het model echt uit Ollama-geheugen is."""
     try:
@@ -204,6 +247,7 @@ def sla_run_op(resultaat: dict) -> None:
         "extracted": resultaat["extracted"],
         "ocr_tekst": resultaat["ocr_tekst"],
         "ruwe_output": resultaat["ruwe_output"],
+        "gpu_cpu": resultaat["gpu_cpu"],
     }
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
@@ -245,7 +289,7 @@ def stap1_extraheer_tekst(pdf_pad: Path) -> str:
     return volledige_tekst
 
 
-def stap2_llm(tekst: str, categorie: str) -> tuple[str, float]:
+def stap2_llm(tekst: str, categorie: str) -> tuple[str, float, dict | None]:
     """Stuur tekst naar het LLM. Geeft (ruwe_output, tijd) terug."""
     schema = CATEGORIE_SCHEMAS.get(categorie, CATEGORIE_SCHEMAS["electricity"])
     user_prompt = USER_PROMPT_TEMPLATE.format(schema=schema) + tekst
@@ -258,11 +302,13 @@ def stap2_llm(tekst: str, categorie: str) -> tuple[str, float]:
             {"role": "user", "content": user_prompt},
         ],
         format="json",
-        options={"temperature": 0.1, "num_ctx": 32768, "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+        options={"temperature": 0.1, "num_ctx": 16384, "cache_type_k": "q4_0", "cache_type_v": "q4_0"},
+        keep_alive=0,
         think=False,
     )
     tijd = time.time() - start
-    return response.message.content, round(tijd, 2)
+    gpu_cpu = toon_gpu_cpu_verdeling()
+    return response.message.content, round(tijd, 2), gpu_cpu
 
 
 def parse_json(ruwe_output: str) -> dict | None:
@@ -308,10 +354,10 @@ def verwerk_factuur(pdf_pad: Path) -> list[dict]:
         run_start = time.time()
 
         # Tekst extraheren per run (digitaal via pdfplumber, gescand via OCR)
-        tekst = stap1_extraheer_tekst(pdf_pad)
+        tekst = opkuis_tekst(stap1_extraheer_tekst(pdf_pad))
 
         # LLM (model laadt hier opnieuw)
-        ruwe_output, _ = stap2_llm(tekst, categorie)
+        ruwe_output, _, gpu_cpu = stap2_llm(tekst, categorie)
 
         tijd_totaal = round(time.time() - run_start, 2)
         extracted = parse_json(ruwe_output)
@@ -329,11 +375,25 @@ def verwerk_factuur(pdf_pad: Path) -> list[dict]:
             "extracted": extracted,
             "ocr_tekst": tekst,
             "ruwe_output": ruwe_output,
+            "gpu_cpu": gpu_cpu,
         })
 
     tijden = [r["tijd_totaal"] for r in runs]
     print(f"\n   Runs klaar — tijden: {tijden}")
     return runs
+
+
+def timeout_runs(pdf_pad: Path, fout: Exception) -> list[dict]:
+    return [{
+        "bestand": pdf_pad.name,
+        "categorie": pdf_pad.parent.name,
+        "run": run,
+        "success": False,
+        "tijd_totaal": FACTUUR_TIMEOUT_SECONDEN,
+        "extracted": None,
+        "ocr_tekst": "",
+        "ruwe_output": f"Timeout: {fout}",
+    } for run in range(1, RUNS + 1)]
 
 
 # ──────────────────────────────────────────────
@@ -362,7 +422,12 @@ def main() -> None:
         if not pdf_pad.exists():
             print(f"   Bestand niet gevonden: {pdf_pad}")
             continue
-        runs = verwerk_factuur(pdf_pad)
+        try:
+            with factuur_timeout():
+                runs = verwerk_factuur(pdf_pad)
+        except FactuurTimeout as e:
+            print(f"   TIMEOUT na {FACTUUR_TIMEOUT_SECONDEN // 60} min: {pdf_pad.name}")
+            runs = timeout_runs(pdf_pad, e)
         for run in runs:
             sla_run_op(run)
         alle_runs.extend(runs)

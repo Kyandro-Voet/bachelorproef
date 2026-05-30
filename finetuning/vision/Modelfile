@@ -1,0 +1,5 @@
+FROM qwen3vl-8b-q4_k_m.gguf
+PARAMETER temperature 0.1
+PARAMETER num_ctx 8192
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
